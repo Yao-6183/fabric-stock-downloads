@@ -1,0 +1,223 @@
+name: Transfer verified Windows downloads
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: Temporary download plan JSON (release_id, version, assets)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-download-transfer
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    if: github.repository == 'Yao-6183/fabric-stock-downloads'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PLAN: ${{ inputs.plan }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and verify data, then upload to the existing draft
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          REPOSITORY = "Yao-6183/fabric-stock-downloads"
+          VERSION = "0.3.1"
+          MAX_SIZE = 512 * 1024 * 1024
+          HOSTS = {
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com",
+              "github.com",
+              "github-releases.githubusercontent.com",
+          }
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def validate_url(url):
+              require(isinstance(url, str) and len(url) <= 16384, "Invalid download URL.")
+              require(not any(ord(c) < 33 or ord(c) > 126 for c in url), "Invalid download URL characters.")
+              parsed = urllib.parse.urlsplit(url)
+              require(parsed.scheme == "https" and parsed.netloc in HOSTS,
+                      "Download URL host is not allowed.")
+              require(parsed.hostname in HOSTS and parsed.username is None and parsed.password is None
+                      and parsed.port is None and not parsed.fragment, "Invalid download URL authority.")
+              return url
+
+          class DownloadRedirects(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  validate_url(newurl)
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+          class NoRedirects(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError("Unexpected GitHub API redirect.")
+
+          # Separate openers: the CDN client never receives authentication headers.
+          downloader = urllib.request.build_opener(DownloadRedirects())
+          api_client = urllib.request.build_opener(NoRedirects())
+
+          def api(endpoint, method="GET"):
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/" + REPOSITORY + "/" + endpoint,
+                  method=method,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "fabric-stock-download-transfer",
+                  },
+              )
+              with api_client.open(request, timeout=60) as response:
+                  raw = response.read(4 * 1024 * 1024 + 1)
+              require(len(raw) <= 4 * 1024 * 1024, "GitHub API response is too large.")
+              return json.loads(raw) if raw else None
+
+          def draft_release(release_id):
+              release = api(f"releases/{release_id}")
+              require(release.get("id") == release_id and release.get("tag_name") == "v" + VERSION
+                      and release.get("draft") is True and release.get("prerelease") is False,
+                      "The matching stable release must still be a draft.")
+              return release
+
+          def assets(release_id):
+              result = []
+              for page in range(1, 11):
+                  batch = api(f"releases/{release_id}/assets?per_page=100&page={page}")
+                  require(isinstance(batch, list), "Invalid release assets response.")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+              raise RuntimeError("Too many release assets.")
+
+          def matches(remote, asset):
+              return (remote.get("name") == asset["name"] and remote.get("state") == "uploaded"
+                      and remote.get("size") == asset["size"]
+                      and remote.get("digest") == "sha256:" + asset["sha256"])
+
+          def download(asset, path):
+              request = urllib.request.Request(validate_url(asset["url"]), headers={
+                  "User-Agent": "fabric-stock-download-transfer",
+              })
+              digest = hashlib.sha256()
+              size = 0
+              with downloader.open(request, timeout=120) as response, path.open("wb") as destination:
+                  validate_url(response.geturl())
+                  require(response.status == 200, "Download did not return a complete file.")
+                  length = response.headers.get("Content-Length")
+                  if length is not None:
+                      require(int(length) == asset["size"], "Download length header differs.")
+                  while True:
+                      block = response.read(min(1024 * 1024, asset["size"] - size + 1))
+                      if not block:
+                          break
+                      size += len(block)
+                      require(size <= asset["size"] and size <= MAX_SIZE, "Download exceeded expected size.")
+                      digest.update(block)
+                      destination.write(block)
+              require(size == asset["size"] and digest.hexdigest() == asset["sha256"],
+                      "Downloaded size or SHA-256 differs.")
+              print("Download verified: " + asset["name"], flush=True)
+
+          def upload(release_id, asset, path):
+              # Authorization goes to curl on stdin, never in the process arguments.
+              headers = ("Authorization: Bearer " + os.environ["GH_TOKEN"]
+                         + "\nAccept: application/vnd.github+json"
+                         + "\nX-GitHub-Api-Version: 2022-11-28"
+                         + "\nContent-Type: application/octet-stream\n").encode()
+              url = (f"https://uploads.github.com/repos/{REPOSITORY}/releases/{release_id}/assets?name="
+                     + urllib.parse.quote(asset["name"], safe=""))
+              result = subprocess.run([
+                  "curl", "--silent", "--show-error", "--fail-with-body",
+                  "--proto", "=https", "--connect-timeout", "30", "--max-time", "1800",
+                  "--speed-time", "120", "--speed-limit", "1024",
+                  "--header", "@-", "--request", "POST", "--data-binary", "@" + str(path), url,
+              ], input=headers, capture_output=True, timeout=1830, check=False)
+              require(result.returncode == 0, "GitHub asset upload failed.")
+              require(matches(json.loads(result.stdout), asset), "Uploaded asset verification failed.")
+              print("Upload verified: " + asset["name"], flush=True)
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository.")
+              raw = os.environ["PLAN"]
+              require(len(raw) <= 65536, "Download plan is too large.")
+              plan = json.loads(raw)
+              require(isinstance(plan, dict) and set(plan) == {"release_id", "version", "assets"},
+                      "Invalid download plan fields.")
+              require(type(plan["release_id"]) is int and plan["release_id"] > 0
+                      and plan["version"] == VERSION, "Invalid release identity.")
+              items = plan["assets"]
+              require(isinstance(items, list) and len(items) == 2, "Exactly two download assets are required.")
+              expected = {"FabricStock-Setup.exe", f"fabric-stock-{VERSION}-win-x64.zip"}
+              names = set()
+              for asset in items:
+                  require(isinstance(asset, dict) and set(asset) == {"name", "url", "size", "sha256"},
+                          "Invalid asset fields.")
+                  require(isinstance(asset["name"], str) and asset["name"] in expected
+                          and asset["name"] not in names, "Unexpected or duplicate asset name.")
+                  names.add(asset["name"])
+                  require(type(asset["size"]) is int and 0 < asset["size"] <= MAX_SIZE, "Invalid asset size.")
+                  require(isinstance(asset["sha256"], str) and re.fullmatch("[0-9a-f]{64}", asset["sha256"]),
+                          "Invalid SHA-256 digest.")
+                  validate_url(asset["url"])
+              require(names == expected, "Both approved download filenames are required.")
+              release_id = plan["release_id"]
+              draft_release(release_id)
+              with tempfile.TemporaryDirectory(prefix="fabric-transfer-") as directory:
+                  current = assets(release_id)
+                  pending = []
+                  for asset in items:
+                      found = [remote for remote in current if remote.get("name") == asset["name"]]
+                      if len(found) != 1 or not matches(found[0], asset):
+                          pending.append(asset)
+                  # Verify all missing data before replacing any existing draft assets.
+                  for asset in pending:
+                      download(asset, Path(directory) / asset["name"])
+                  for asset in items:
+                      draft_release(release_id)
+                      existing = [remote for remote in assets(release_id) if remote.get("name") == asset["name"]]
+                      if len(existing) == 1 and matches(existing[0], asset):
+                          print("Reused verified asset: " + asset["name"], flush=True)
+                          continue
+                      require((Path(directory) / asset["name"]).is_file(),
+                              "Draft assets changed during transfer; rerun to recover.")
+                      for remote in existing:
+                          require(type(remote.get("id")) is int and remote["id"] > 0, "Invalid asset identity.")
+                          draft_release(release_id)
+                          api(f"releases/assets/{remote['id']}", method="DELETE")
+                      draft_release(release_id)
+                      upload(release_id, asset, Path(directory) / asset["name"])
+                  draft_release(release_id)
+                  final = assets(release_id)
+                  for asset in items:
+                      found = [remote for remote in final if remote.get("name") == asset["name"]]
+                      require(len(found) == 1 and matches(found[0], asset), "Final remote verification failed.")
+                      print("Final size and SHA-256 verified: " + asset["name"], flush=True)
+              print("Both downloads verified. Release remains a draft.", flush=True)
+
+          try:
+              main()
+          except Exception:
+              # urllib/JSON/curl errors can contain signed URLs or response data.
+              # Never print their messages, tracebacks, plan, or captured streams.
+              print("Transfer failed safely; release has not been published. Check the plan and draft assets.", file=sys.stderr)
+              sys.exit(1)
