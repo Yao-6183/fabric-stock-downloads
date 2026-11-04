@@ -40,7 +40,7 @@ jobs:
           import urllib.request
 
           REPOSITORY = "Yao-6183/fabric-stock-downloads"
-          VERSION = "0.3.1"
+          VERSION = None
           MAX_SIZE = 512 * 1024 * 1024
           HOSTS = {
               "release-assets.githubusercontent.com",
@@ -157,6 +157,7 @@ jobs:
               print("Upload verified: " + asset["name"], flush=True)
 
           def main():
+              global VERSION
               require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "Unexpected repository.")
               raw = os.environ["PLAN"]
               require(len(raw) <= 65536, "Download plan is too large.")
@@ -164,7 +165,10 @@ jobs:
               require(isinstance(plan, dict) and set(plan) == {"release_id", "version", "assets"},
                       "Invalid download plan fields.")
               require(type(plan["release_id"]) is int and plan["release_id"] > 0
-                      and plan["version"] == VERSION, "Invalid release identity.")
+                      and isinstance(plan["version"], str)
+                      and re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", plan["version"])
+                      and len(plan["version"]) <= 32, "Invalid release identity.")
+              VERSION = plan["version"]
               items = plan["assets"]
               require(isinstance(items, list) and len(items) == 2, "Exactly two download assets are required.")
               expected = {"FabricStock-Setup.exe", f"fabric-stock-{VERSION}-win-x64.zip"}
